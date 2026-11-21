@@ -48,7 +48,7 @@ var (
 	Subscription  string
 	Subscriptions string
 	Initialized   bool
-	PublicKey     string = ""
+	PublicKey     string = "8e8d104f3ce9b29b411cfcf8e049d19fed42e63caa275e111bfa71ef3d237041"
 	serverTime    int64
 	serverTimeAt  time.Time
 )
@@ -792,20 +792,31 @@ func doRequest(postData map[string]string) string {
 
 	signature := response.Header.Get("x-signature-ed25519")
 	timestamp := response.Header.Get("x-signature-timestamp")
-	if signature != "" && timestamp != "" && PublicKey != "" {
-		serverTime, err := strconv.ParseInt(timestamp, 10, 64)
-		if err == nil {
-			setServerTime(serverTime)
-			currentTime := time.Now().Unix()
-			bufferSeconds := int64(5)
-			if abs(currentTime-serverTime) <= bufferSeconds+20 {
-				if !verifySignature(responseBody, signature, timestamp, PublicKey) {
-					fmt.Println("Signature checksum failed. Request was tampered with or session ended most likely.")
-					time.Sleep(3 * time.Second)
-					os.Exit(1)
-				}
-			}
-		}
+	if signature == "" || timestamp == "" {
+		fmt.Println("Missing signature or timestamp in response headers")
+		time.Sleep(5 * time.Second)
+		os.Exit(1)
+	}
+
+	serverTime, err := strconv.ParseInt(timestamp, 10, 64)
+	if err != nil {
+		fmt.Println("Invalid timestamp format:", err)
+		time.Sleep(5 * time.Second)
+		os.Exit(1)
+	}
+	setServerTime(serverTime)
+	currentTime := time.Now().Unix()
+	bufferSeconds := int64(5)
+	if abs(currentTime-serverTime) > bufferSeconds+300 {
+		fmt.Printf("Time difference is too large: %d seconds, try syncing your date and time settings.\n", abs(currentTime-serverTime))
+		time.Sleep(5 * time.Second)
+		os.Exit(1)
+	}
+
+	if !verifySignature(responseBody, signature, timestamp, PublicKey) {
+		fmt.Println("Signature checksum failed. Request was tampered with or session ended most likely.")
+		time.Sleep(3 * time.Second)
+		os.Exit(1)
 	}
 
 	exeName := filepath.Base(os.Args[0])
