@@ -16,6 +16,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/url"
 	"os/exec"
@@ -764,7 +765,22 @@ func IsEmpty() {
 	}
 }
 
+func checkHostSpoofing(domain string) {
+	ips, err := net.LookupIP(domain)
+	if err != nil {
+		return
+	}
+	for _, ip := range ips {
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() {
+			fmt.Println("File/hosts manipulation detected. Terminating process.")
+			time.Sleep(3 * time.Second)
+			os.Exit(1)
+		}
+	}
+}
+
 func doRequest(postData map[string]string) string {
+	checkHostSpoofing("authkeyz.bond")
 	requestBody := url.Values{}
 	for key, value := range postData {
 		requestBody.Set(key, value)
@@ -790,33 +806,51 @@ func doRequest(postData map[string]string) string {
 		return ""
 	}
 
-	signature := response.Header.Get("x-signature-ed25519")
-	timestamp := response.Header.Get("x-signature-timestamp")
-	if signature == "" || timestamp == "" {
-		fmt.Println("Missing signature or timestamp in response headers")
-		time.Sleep(5 * time.Second)
-		os.Exit(1)
-	}
+	reqType := postData["type"]
+	if reqType != "log" && reqType != "file" && reqType != "2faenable" && reqType != "2fadisable" {
+		signature := response.Header.Get("x-signature-ed25519")
+		timestamp := response.Header.Get("x-signature-timestamp")
+		if signature == "" || timestamp == "" {
+			fmt.Println("Missing signature or timestamp in response headers")
+			time.Sleep(5 * time.Second)
+			os.Exit(1)
+		}
 
-	serverTime, err := strconv.ParseInt(timestamp, 10, 64)
-	if err != nil {
-		fmt.Println("Invalid timestamp format:", err)
-		time.Sleep(5 * time.Second)
-		os.Exit(1)
-	}
-	setServerTime(serverTime)
-	currentTime := time.Now().Unix()
-	bufferSeconds := int64(5)
-	if abs(currentTime-serverTime) > bufferSeconds+300 {
-		fmt.Printf("Time difference is too large: %d seconds, try syncing your date and time settings.\n", abs(currentTime-serverTime))
-		time.Sleep(5 * time.Second)
-		os.Exit(1)
-	}
+		serverTime, err := strconv.ParseInt(timestamp, 10, 64)
+		if err != nil {
+			fmt.Println("Invalid timestamp format:", err)
+			time.Sleep(5 * time.Second)
+			os.Exit(1)
+		}
+		setServerTime(serverTime)
+		currentTime := time.Now().Unix()
+		bufferSeconds := int64(5)
+		if abs(currentTime-serverTime) > bufferSeconds+300 {
+			fmt.Printf("Time difference is too large: %d seconds, try syncing your date and time settings.\n", abs(currentTime-serverTime))
+			time.Sleep(5 * time.Second)
+			os.Exit(1)
+		}
 
-	if !verifySignature(responseBody, signature, timestamp, PublicKey) {
-		fmt.Println("Signature checksum failed. Request was tampered with or session ended most likely.")
-		time.Sleep(3 * time.Second)
-		os.Exit(1)
+		if isReplayedSignature(timestamp, signature) {
+			fmt.Println("Replay attack detected: duplicate response signature rejected.")
+			time.Sleep(3 * time.Second)
+			os.Exit(1)
+		}
+
+		if !verifySignature(responseBody, signature, timestamp, PublicKey) {
+			fmt.Println("Signature checksum failed. Request was tampered with or session ended most likely.")
+			time.Sleep(3 * time.Second)
+			os.Exit(1)
+		}
+
+		var envMap map[string]interface{}
+		if err := json.Unmarshal(responseBody, &envMap); err == nil {
+			if respOwner, ok := envMap["ownerid"].(string); ok && respOwner != "" && respOwner != OwnerID {
+				fmt.Println("Application ownerid mismatch detected. Terminating process.")
+				time.Sleep(3 * time.Second)
+				os.Exit(1)
+			}
+		}
 	}
 
 	exeName := filepath.Base(os.Args[0])
@@ -843,6 +877,17 @@ func doRequest(postData map[string]string) string {
 	}
 
 	return responseText
+}
+
+var seenSignatures = make(map[string]struct{})
+
+func isReplayedSignature(timestamp, signature string) bool {
+	key := timestamp + ":" + signature
+	if _, exists := seenSignatures[key]; exists {
+		return true
+	}
+	seenSignatures[key] = struct{}{}
+	return false
 }
 
 func verifySignature(responseBody []byte, signature, timestamp, publicKey string) bool {
@@ -983,13 +1028,28 @@ func GetHWID() string {
 		return hwid
 
 	case "windows":
-		const xx = "cmd.exe"
+		out, err := exec.Command("whoami", "/user", "/fo", "csv", "/nh").Output()
+		if err == nil {
+			parts := strings.Split(strings.TrimSpace(string(out)), ",")
+			if len(parts) >= 2 {
+				sid := strings.Trim(parts[len(parts)-1], "\" \r\n")
+				if strings.HasPrefix(sid, "S-1-") {
+					return sid
+				}
+			}
+		}
+
+		psOut, psErr := exec.Command("powershell", "-NoProfile", "-Command", "([System.Security.Principal.WindowsIdentity]::GetCurrent()).User.Value").Output()
+		if psErr == nil {
+			if sid := strings.TrimSpace(string(psOut)); sid != "" {
+				return sid
+			}
+		}
 
 		var stdout bytes.Buffer
-		cmd := exec.Command(xx, "/c", "wmic useraccount where name='%username%' get sid")
+		cmd := exec.Command("cmd.exe", "/c", "wmic useraccount where name='%username%' get sid")
 		cmd.Stdout = &stdout
-		err := cmd.Run()
-		if err != nil {
+		if err := cmd.Run(); err != nil {
 			return ""
 		}
 
